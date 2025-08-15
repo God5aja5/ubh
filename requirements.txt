@@ -1,0 +1,5 @@
+# File: requirements.txt
+Flask>=2.0
+flask-socketio>=5.3
+python-engineio>=4.3
+python-socketio>=5.7

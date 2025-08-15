@@ -1,0 +1,27 @@
+# File: docker-compose.yml
+version: "3.8"
+services:
+  pysandbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pysandbox_app
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./workspace:/app/workspace
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  ubuntu-ttyd:
+    build:
+      context: .
+      dockerfile: Dockerfile.ttyd
+    container_name: ubuntu_ttyd
+    ports:
+      - "7681:7681"
+    environment:
+      # IMPORTANT: Set this value in a .env file or via your orchestrator; DO NOT commit real passwords.
+      - TTYD_BASIC_AUTH=${TTYD_BASIC_AUTH}
+    volumes:
+      - ./workspace:/home/ubuntu/workspace

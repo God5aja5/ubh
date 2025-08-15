@@ -1,0 +1,15 @@
+# File: render.yaml
+# Example render.com service manifest for deploying the ttyd container.
+# On Render, set TTYD_BASIC_AUTH as a secret in the service settings (do NOT commit it).
+services:
+  - type: web
+    name: pysandbox-ttyd
+    env: docker
+    dockerfilePath: ./Dockerfile.ttyd
+    envVars:
+      - key: TTYD_BASIC_AUTH
+        value: ""  # Set this in Render dashboard's env vars (secret).
+      - key: TTYD_PORT
+        value: "7681"
+    plan: starter
+    region: oregon
