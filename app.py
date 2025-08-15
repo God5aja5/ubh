@@ -40,7 +40,7 @@ import threading
 import subprocess
 from typing import Dict, Any, Optional
 from flask import Flask, jsonify, request, render_template_string, send_file
-from flask_socketio import SocketIO, emit, start_background_task
+from flask_socketio import SocketIO, emit
 
 # Optional resource for UNIX resource limits
 try:
