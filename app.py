@@ -847,8 +847,12 @@ def cleanup():
 
 if __name__ == "__main__":
     try:
-        print("Starting PySandbox on http://127.0.0.1:5000")
-        socketio.run(app, host="0.0.0.0", port=5000, debug=False)
+        port = int(os.environ.get("PORT", 5000))
+        host = "0.0.0.0"
+        print(f"Starting PySandbox on http://{host}:{port} (allow_unsafe_werkzeug={True})")
+        # If you want a more production-ready server, run with eventlet/gevent or use gunicorn.
+        # Quick fix for hosting platforms like Render: allow the Werkzeug server to run.
+        socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
         print("Shutting down, cleaning up processes...")
         cleanup()
