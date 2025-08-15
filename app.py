@@ -1,31 +1,12 @@
 #!/usr/bin/env python3
 """
-app.py - Single-file Flask + Flask-SocketIO sandbox with integrated web PTY terminal,
-file manager, pip installer, single-file runner, and responsive mobile-first UI.
+Updated app.py - Adds improved UI and small backend helpers to support the UI.
 
-Dependencies:
-    pip install flask flask-socketio
-
-Run:
-    TERMINAL_TOKEN=your_token python app.py
-or
-    python app.py
-
-Security:
-- This runs commands and shells on the host. Do NOT expose publicly without strong authentication
-  and additional isolation (containers, VMs, network rules).
-- If you set TERMINAL_TOKEN env var, the browser must provide that token to open the integrated terminal.
-
-Fixes / Improvements in this version:
-- Replaced unsafe pty.fork usage with pty.openpty() + subprocess to avoid forking in threads.
-- Use socketio.start_background_task for reader loops (thread-safe with SocketIO).
-- Emit terminal events reliably and only after background task started.
-- Improved CSS for responsive mobile layout and collapsible sidebar.
-- Various robustness fixes: non-blocking reads, proper cleanup, and safe path handling.
-
-Works on Python 3.10+ (Unix recommended for PTY behavior).
+Notes:
+ - Keep using: pip install flask flask-socketio
+ - Run: TERMINAL_TOKEN=your_token python app.py
+ - Security: This runs commands on the host. Do NOT expose publicly without protection.
 """
-
 import os
 import sys
 import io
@@ -38,11 +19,12 @@ import termios
 import pathlib
 import threading
 import subprocess
+import shutil
+import zipfile
 from typing import Dict, Any, Optional
 from flask import Flask, jsonify, request, render_template_string, send_file
 from flask_socketio import SocketIO, emit
 
-# Optional resource for UNIX resource limits
 try:
     import resource  # type: ignore
 except Exception:
@@ -152,10 +134,17 @@ def _stream_reader(proc: subprocess.Popen, job_id: str, sid: Optional[str], stre
 
 
 def start_subprocess(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[int] = None) -> str:
+    """
+    timeout semantics:
+      - None => use DEFAULT_TIMEOUT
+      - 0 => no timeout (run forever unless killed)
+      - >0 => that many seconds
+    """
     job_id = str(uuid.uuid4())
     preexec = None
     if os.name != "nt" and resource:
         preexec = set_limits_for_child
+
     try:
         proc = subprocess.Popen(
             cmd,
@@ -172,10 +161,17 @@ def start_subprocess(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[
         socketio.emit("proc.exit", {"job_id": job_id, "code": -1}, room=sid or None)
         return job_id
 
-    with process_lock:
-        processes[job_id] = {"proc": proc, "sid": sid, "start": time.time(), "timeout": timeout or DEFAULT_TIMEOUT, "cmd": cmd, "cwd": cwd}
+    # interpret timeout
+    if timeout is None:
+        tval = DEFAULT_TIMEOUT
+    elif timeout == 0:
+        tval = None
+    else:
+        tval = int(timeout)
 
-    # background readers
+    with process_lock:
+        processes[job_id] = {"proc": proc, "sid": sid, "start": time.time(), "timeout": tval, "cmd": cmd, "cwd": cwd}
+
     socketio.start_background_task(_stream_reader, proc, job_id, sid, "stdout", proc.stdout)
     socketio.start_background_task(_stream_reader, proc, job_id, sid, "stderr", proc.stderr)
 
@@ -225,14 +221,9 @@ def stop_subprocess(job_id: str) -> bool:
 
 
 # ----------------------
-# PTY-based integrated terminal (safe spawn with pty.openpty + subprocess)
+# PTY-based terminal helpers (unchanged)
 # ----------------------
 def spawn_pty_process(term_id: str, sid: str, cols: int = 80, rows: int = 24) -> bool:
-    """
-    Allocates a new PTY pair via pty.openpty(), then launches a shell subprocess
-    bound to the slave FD. Parent reads/writes to master_fd.
-    This avoids performing os.fork() in threads which can be unsafe in multi-threaded apps.
-    """
     try:
         import pty as _pty  # local import for clarity
     except Exception:
@@ -246,7 +237,6 @@ def spawn_pty_process(term_id: str, sid: str, cols: int = 80, rows: int = 24) ->
     if os.name != "nt" and resource:
         preexec = set_limits_for_child
 
-    # Start subprocess using slave_fd as its stdio
     try:
         proc = subprocess.Popen(
             [shell, "-i"],
@@ -266,17 +256,14 @@ def spawn_pty_process(term_id: str, sid: str, cols: int = 80, rows: int = 24) ->
         socketio.emit("term.error", {"msg": f"Failed to spawn shell: {e}"}, room=sid)
         return False
 
-    # close slave_fd in parent (it's used by child)
     try:
         os.close(slave_fd)
     except Exception:
         pass
 
-    # Set master fd non-blocking
     flags = fcntl.fcntl(master_fd, fcntl.F_GETFL)
     fcntl.fcntl(master_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
 
-    # reader loop - runs in background task
     def reader():
         try:
             while True:
@@ -290,14 +277,11 @@ def spawn_pty_process(term_id: str, sid: str, cols: int = 80, rows: int = 24) ->
                         text = str(data)
                     socketio.emit("term.output", {"term_id": term_id, "data": text}, room=sid)
                 except OSError:
-                    # EAGAIN or other non-fatal; sleep a bit
                     time.sleep(0.01)
-                    # check if process ended
                     if proc.poll() is not None:
                         break
                     continue
         finally:
-            # cleanup
             try:
                 os.close(master_fd)
             except Exception:
@@ -306,7 +290,6 @@ def spawn_pty_process(term_id: str, sid: str, cols: int = 80, rows: int = 24) ->
             with term_lock:
                 terminals.pop(term_id, None)
 
-    # register terminal meta and start reader background task
     with term_lock:
         terminals[term_id] = {"master_fd": master_fd, "proc": proc, "sid": sid}
 
@@ -365,7 +348,7 @@ def kill_terminal(term_id: str) -> bool:
 
 
 # ----------------------
-# HTML / JS UI (inlined). Responsive & mobile-friendly tweaks
+# HTML / JS UI (inlined). Responsive & mobile-friendly, orange accents
 # ----------------------
 INDEX_HTML = """
 <!doctype html>
@@ -373,22 +356,23 @@ INDEX_HTML = """
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>PySandbox - Integrated Terminal + File Manager</title>
+<title>PySandbox - Orange UI</title>
 <style>
-:root{--bg:#071022;--panel:#061427;--muted:#95a3b3;--accent:#60a5fa;--text:#e6eef8}
-[data-theme="light"]{--bg:#f6f8fb;--panel:#fff;--muted:#556070;--accent:#0ea5a3;--text:#0b1220}
+:root{--bg:#0b0a0a;--panel:#101010;--muted:#9aa4ad;--accent:#ff7a18;--text:#f6f6f6}
+[data-theme="light"]{--bg:#f6f7f8;--panel:#fff;--muted:#556070;--accent:#ff7a18;--text:#0b1220}
 *{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial}
-html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#021022);color:var(--text)}
-.header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:var(--panel);}
-.brand{font-weight:700}
-.container{display:flex;gap:12px;padding:12px;height:calc(100vh - 72px)}
-.sidebar{width:300px;background:linear-gradient(180deg,#041426,#03121a);padding:12px;border-radius:10px;display:flex;flex-direction:column;gap:12px}
+html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#041018);color:var(--text)}
+.header{display:flex;align-items:center;justify-content:space-between;padding:10px 16px;background:linear-gradient(90deg, rgba(255,122,24,0.06), transparent);backdrop-filter: blur(6px);}
+.brand{font-weight:800;display:flex;align-items:center;gap:8px}
+.logo{width:26px;height:26px;border-radius:6px;background:linear-gradient(180deg,var(--accent),#ff9a4a);display:inline-block}
+.container{display:flex;gap:12px;padding:12px;height:calc(100vh - 64px)}
+.sidebar{width:320px;background:linear-gradient(180deg,#08121a,#051018);padding:12px;border-radius:12px;display:flex;flex-direction:column;gap:12px;min-height:0}
 .sidebar.collapsed{width:64px}
-.content{flex:1;display:flex;flex-direction:column;gap:12px}
+.content{flex:1;display:flex;flex-direction:column;gap:12px;min-height:0}
 .top-actions{display:flex;gap:8px;align-items:center}
-.panel{background:linear-gradient(180deg,#031225,#02111a);border-radius:10px;padding:12px;overflow:auto}
+.panel{background:linear-gradient(180deg,#07121a,#051018);border-radius:10px;padding:12px;overflow:auto;min-height:0}
 .grid{display:grid;grid-template-columns:1fr 420px;gap:12px;min-height:0}
-@media (max-width:900px){
+@media (max-width:980px){
   .container{flex-direction:column;height:auto}
   .sidebar{width:100%;flex-direction:row;overflow:auto}
   .grid{grid-template-columns:1fr}
@@ -397,15 +381,19 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
 .input{padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);background:transparent;color:var(--text);flex:1}
 .terminal{background:#000;padding:8px;border-radius:8px;color:#e6eef8;height:220px;overflow:auto;font-family:monospace}
 .xterm-wrapper{height:60vh;border-radius:8px;overflow:hidden;background:#000}
-.term-modal{position:fixed;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)}
-.term-box{width:95%;height:85%;max-width:1200px;background:#071227;border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
-.term-header{display:flex;align-items:center;justify-content:space-between;padding:8px;background:#071827;color:#a8b3bd}
-.term-body{flex:1;display:flex;flex-direction:column;gap:8px;padding:8px}
 .small{font-size:13px;color:var(--muted)}
 .previewLink{color:var(--accent);text-decoration:none}
+.section-title{font-weight:700;color:var(--accent)}
+.footer-note{font-size:12px;color:var(--muted);margin-top:8px}
+.left-menu{display:flex;flex-direction:column;gap:6px}
+.left-menu .button{display:flex;align-items:center;gap:8px}
+.file-row{display:flex;justify-content:space-between;align-items:center;padding:6px;border-radius:6px}
+.file-row:hover{background:rgba(255,255,255,0.02)}
+.editor{width:100%;height:60vh;background:transparent;border-radius:6px;padding:8px;border:1px solid rgba(255,255,255,0.03);color:var(--text);font-family:monospace}
+.small-btn{padding:6px;border-radius:6px;font-size:13px}
+.badge{background:rgba(255,255,255,0.03);padding:4px 6px;border-radius:6px;font-size:13px}
 </style>
 
-<!-- xterm.js and addons -->
 <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.1.0/css/xterm.css" />
 <script src="https://cdn.jsdelivr.net/npm/xterm@5.1.0/lib/xterm.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
@@ -413,120 +401,202 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
 </head>
 <body data-theme="dark">
 <div class="header">
-  <div class="brand">PySandbox</div>
-  <div>
+  <div class="brand"><span class="logo"></span> PySandbox</div>
+  <div style="display:flex;gap:8px;align-items:center">
+    <div class="small">Workspace: <span class="badge" id="cwdDisp"></span></div>
     <button id="themeToggle" class="button">Toggle Theme</button>
   </div>
 </div>
 
 <div class="container">
   <div id="sidebar" class="sidebar">
-    <div style="display:flex;flex-direction:column;gap:8px">
-      <button id="openTerminalBtn" class="button">Open Terminal</button>
-      <button id="openRunnerBtn" class="button">Single-file Runner</button>
-      <button id="openPipBtn" class="button">Pip Installer</button>
-      <button id="openFMBtn" class="button">File Manager</button>
+    <div class="left-menu">
+      <button id="navHome" class="button">Home</button>
+      <button id="navTerminal" class="button">Terminal</button>
+      <button id="navRunner" class="button">Runner</button>
+      <button id="navPip" class="button">Pip Installer</button>
+      <button id="navFiles" class="button">File Manager</button>
+      <button id="navHost" class="button">Host (24/7)</button>
     </div>
-    <div style="margin-top:auto" class="small">Workspace: <span id="cwdDisp"></span></div>
+    <div style="margin-top:auto">
+      <div class="small">Token-protected: <span id="tokenState"></span></div>
+      <div class="footer-note">Be careful: this environment executes host commands.</div>
+    </div>
   </div>
 
   <div class="content">
-    <div class="top-actions">
-      <div style="font-weight:700">Integrated Terminal & Tools</div>
-      <div style="flex:1"></div>
-      <div class="small">Token-protected: <span id="tokenState"></span></div>
-    </div>
-
-    <div class="grid">
-      <div class="panel">
-        <div style="font-weight:700;margin-bottom:8px">Single-file Runner</div>
-        <textarea id="runnerCode" style="width:100%;height:180px;background:transparent;border-radius:6px;padding:8px;border:1px solid rgba(255,255,255,0.03);color:var(--text);font-family:monospace" placeholder="# Paste Python code here"></textarea>
-        <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
-          <input id="runnerTimeout" class="input" style="width:120px" placeholder="Timeout(s)" value="60"/>
-          <button id="runnerRun" class="button">Run</button>
-          <button id="runnerStop" class="button">Stop</button>
-          <a id="runnerPreview" class="previewLink" href="#" target="_blank" style="display:none;margin-left:8px">Open Preview</a>
-        </div>
-        <div style="margin-top:12px">
-          <div style="font-weight:600">Output</div>
-          <pre id="runnerOutput" class="terminal"></pre>
+    <!-- Top: Runner -->
+    <div class="panel" id="viewRunner">
+      <div class="section-title">Single-file Runner</div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <textarea id="runnerCode" class="editor" placeholder="# Paste Python code here"></textarea>
+        <div style="width:360px;display:flex;flex-direction:column;gap:8px">
+          <div>
+            <div style="display:flex;gap:8px;align-items:center">
+              <input id="runnerTimeout" class="input" style="width:130px" placeholder="Timeout(s)" value="60"/>
+              <button id="runnerRun" class="button">Run</button>
+              <button id="runnerStop" class="button">Stop</button>
+              <button id="runnerClear" class="button">Clear Output</button>
+            </div>
+            <a id="runnerPreview" class="previewLink" href="#" target="_blank" style="display:none;margin-left:8px">Open Preview</a>
+          </div>
+          <div style="flex:1;display:flex;flex-direction:column">
+            <div style="font-weight:600;margin-bottom:6px">Output (interactive)</div>
+            <div id="runnerOutput" class="terminal" contenteditable="false" style="flex:1;white-space:pre-wrap;overflow:auto"></div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <input id="runnerStdIn" class="input" placeholder="Send stdin to running job"/>
+              <button id="runnerSend" class="button">Send</button>
+            </div>
+          </div>
         </div>
       </div>
+    </div>
 
-      <div class="panel">
-        <div style="font-weight:700;margin-bottom:8px">Terminals & Logs</div>
-        <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+    <!-- Grid: Commands and Pip -->
+    <div class="grid">
+      <div class="panel" id="viewCommands">
+        <div class="section-title">Commands & Jobs</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
           <input id="cmdInput" class="input" placeholder="Run command (e.g., python -m pip install requests)" />
           <input id="cmdCwd" class="input" style="width:160px" placeholder="cwd (relative)" />
           <button id="cmdRun" class="button">Run</button>
+          <button id="cmdClear" class="button">Clear Global Output</button>
         </div>
-        <div style="display:flex;gap:8px">
-          <div style="flex:1">
+
+        <div style="display:flex;gap:8px;margin-top:12px;min-height:0">
+          <div style="flex:1;display:flex;flex-direction:column;min-height:0">
             <div style="font-weight:600">Global Output</div>
-            <pre id="globalOutput" class="terminal"></pre>
+            <div id="globalOutput" class="terminal" contenteditable="false" style="flex:1;overflow:auto"></div>
+            <div style="display:flex;gap:8px;margin-top:8px">
+              <input id="globalStdIn" class="input" placeholder="Send stdin to job (job id auto)" />
+              <button id="globalSend" class="button">Send</button>
+            </div>
           </div>
-          <div style="width:200px">
+
+          <div style="width:220px">
             <div style="font-weight:600">Active Jobs</div>
             <div id="jobList" style="background:rgba(255,255,255,0.01);padding:6px;border-radius:6px;max-height:300px;overflow:auto"></div>
+            <div style="margin-top:8px">
+              <div style="font-weight:600">Pip Installer</div>
+              <div style="display:flex;gap:6px;margin-top:6px">
+                <input id="pipPkg" class="input" placeholder="package or -r requirements.txt" />
+                <button id="pipInstall" class="button">Install</button>
+              </div>
+              <div style="display:flex;gap:6px;margin-top:6px">
+                <button id="pipClear" class="button small-btn">Clear</button>
+              </div>
+              <div style="margin-top:6px">
+                <div class="small">Pip Output</div>
+                <pre id="pipOutput" class="terminal" style="height:140px;overflow:auto"></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" id="viewFiles">
+        <div class="section-title">File Manager</div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+          <input id="fmPath" class="input" placeholder="path (relative)" />
+          <button id="fmCreateFile" class="button">Create File</button>
+          <button id="fmCreateDir" class="button">Create Folder</button>
+          <input id="hiddenUpload" type="file" multiple webkitdirectory directory mozdirectory style="display:none"/>
+          <button id="fmUpload" class="button">Upload</button>
+          <button id="fmRefresh" class="button">Refresh</button>
+          <button id="downloadZip" class="button">Download Workspace ZIP</button>
+        </div>
+
+        <div style="display:flex;gap:12px;margin-top:12px">
+          <div style="flex:1;max-height:420px;overflow:auto;border-radius:6px;padding:8px;background:rgba(255,255,255,0.01)" id="fileTree"></div>
+          <div style="width:420px;display:flex;flex-direction:column;gap:8px">
+            <div style="font-weight:600">File Editor</div>
+            <input id="editorPath" class="input" placeholder="Select a file from tree" />
+            <textarea id="editorContent" class="editor" placeholder="File content..." ></textarea>
+            <div style="display:flex;gap:8px">
+              <button id="fileSave" class="button">Save</button>
+              <button id="fileUnzip" class="button">Unzip Here</button>
+              <button id="fileDelete" class="button">Delete</button>
+              <button id="fileClear" class="button">Clear Editor</button>
+              <button id="fileDownload" class="button">Download</button>
+            </div>
           </div>
         </div>
       </div>
     </div>
 
-    <div style="margin-top:12px" class="panel">
-      <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
-        <div style="font-weight:700">File Manager</div>
-        <div class="small">Upload files/folders, create, delete, download</div>
+    <!-- Host section -->
+    <div class="panel" id="viewHost" style="display:none">
+      <div class="section-title">Host (keep script running)</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <input id="hostPath" class="input" placeholder="script path (relative) e.g. app.py" />
+        <button id="hostStart" class="button">Start Host</button>
+        <button id="hostStop" class="button">Stop Host</button>
+        <button id="hostClear" class="button">Clear Host Output</button>
       </div>
-      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
-        <input id="fmPath" class="input" placeholder="path (relative)" />
-        <button id="fmCreateFile" class="button">Create File</button>
-        <button id="fmCreateDir" class="button">Create Folder</button>
-        <input id="hiddenUpload" type="file" multiple webkitdirectory directory mozdirectory style="display:none"/>
-        <button id="fmUpload" class="button">Upload</button>
-        <button id="fmRefresh" class="button">Refresh</button>
+      <div style="margin-top:12px">
+        <div style="font-weight:600">Host Output (persistent)</div>
+        <pre id="hostOutput" class="terminal" style="height:220px;overflow:auto"></pre>
       </div>
-      <div id="fileTree" style="margin-top:8px;max-height:240px;overflow:auto;border-radius:6px;padding:8px;background:rgba(255,255,255,0.01)"></div>
     </div>
 
   </div>
 </div>
 
-<!-- Terminal modal -->
-<div id="termModal" class="term-modal" style="display:none">
-  <div class="term-box" role="dialog" aria-modal="true">
-    <div class="term-header">
-      <div>Integrated Shell <span id="termIdLabel" class="small"></span></div>
+<!-- Terminal modal (xterm) -->
+<div id="termModal" style="display:none;position:fixed;left:0;top:0;width:100%;height:100%;background:rgba(0,0,0,0.6);align-items:center;justify-content:center">
+  <div style="width:95%;height:90%;max-width:1200px;background:var(--panel);border-radius:8px;display:flex;flex-direction:column;overflow:hidden">
+    <div style="display:flex;align-items:center;justify-content:space-between;padding:8px;border-bottom:1px solid rgba(255,255,255,0.02)">
+      <div style="display:flex;gap:12px;align-items:center">
+        <div style="font-weight:700">Integrated Shell</div>
+        <div id="termIdLabel" class="small"></div>
+      </div>
       <div>
         <span id="termStatus" class="small">Disconnected</span>
         <button id="termClose" class="button">Close</button>
       </div>
     </div>
-    <div class="term-body">
-      <div style="display:flex;gap:8px;align-items:center">
-        <div style="display:flex;gap:6px">
-          <button id="termKill" class="button">Kill</button>
-          <button id="termClear" class="button">Clear</button>
-        </div>
-        <div style="margin-left:auto;display:flex;gap:6px;align-items:center">
-          <input id="tokenInput" class="input" placeholder="Terminal token (if required)" />
-          <button id="termConnect" class="button">Connect</button>
-        </div>
+    <div style="padding:8px;display:flex;flex-direction:column;height:100%">
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <button id="termKill" class="button">Kill</button>
+        <button id="termClear" class="button">Clear</button>
+        <input id="tokenInput" class="input" placeholder="Terminal token (if required)" />
+        <button id="termConnect" class="button">Connect</button>
       </div>
       <div id="xterm" class="xterm-wrapper"></div>
     </div>
   </div>
 </div>
 
-<script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm@5.1.0/lib/xterm.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
 <script>
 (function(){
   const socket = io({transports:['websocket'], upgrade:false});
   const cwdDisp = document.getElementById('cwdDisp');
   cwdDisp.textContent = "{{WORKDIR}}";
   document.getElementById('tokenState').textContent = {{ 'true' if TERMINAL_TOKEN else 'false' }};
+
+  // Views
+  const viewRunner = document.getElementById('viewRunner');
+  const viewCommands = document.getElementById('viewCommands');
+  const viewFiles = document.getElementById('viewFiles');
+  const viewHost = document.getElementById('viewHost');
+
+  function showView(name){
+    viewRunner.style.display = name==='runner' ? 'block' : 'none';
+    viewCommands.style.display = name==='commands' ? 'block' : 'none';
+    viewFiles.style.display = name==='files' ? 'block' : 'none';
+    viewHost.style.display = name==='host' ? 'block' : 'none';
+  }
+
+  // nav buttons
+  document.getElementById('navHome').onclick = ()=> showView('runner');
+  document.getElementById('navTerminal').onclick = ()=> openTerminalModal();
+  document.getElementById('navRunner').onclick = ()=> showView('runner');
+  document.getElementById('navPip').onclick = ()=> showView('commands');
+  document.getElementById('navFiles').onclick = ()=> showView('files');
+  document.getElementById('navHost').onclick = ()=> showView('host');
+
+  // initial
+  showView('runner');
 
   // Elements
   const globalOutput = document.getElementById('globalOutput');
@@ -535,20 +605,19 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
   const runnerStop = document.getElementById('runnerStop');
   const runnerTimeout = document.getElementById('runnerTimeout');
   const runnerPreview = document.getElementById('runnerPreview');
+  const runnerClear = document.getElementById('runnerClear');
+  const runnerStdIn = document.getElementById('runnerStdIn');
+  const runnerSend = document.getElementById('runnerSend');
 
   const cmdInput = document.getElementById('cmdInput');
   const cmdCwd = document.getElementById('cmdCwd');
   const cmdRun = document.getElementById('cmdRun');
+  const cmdClear = document.getElementById('cmdClear');
 
-  const termModal = document.getElementById('termModal');
-  const openTerminalBtn = document.getElementById('openTerminalBtn');
-  const termConnect = document.getElementById('termConnect');
-  const termClose = document.getElementById('termClose');
-  const tokenInput = document.getElementById('tokenInput');
-  const termStatus = document.getElementById('termStatus');
-  const termIdLabel = document.getElementById('termIdLabel');
-  const termKill = document.getElementById('termKill');
-  const termClear = document.getElementById('termClear');
+  const pipPkg = document.getElementById('pipPkg');
+  const pipInstall = document.getElementById('pipInstall');
+  const pipOutput = document.getElementById('pipOutput');
+  const pipClear = document.getElementById('pipClear');
 
   const fmUpload = document.getElementById('fmUpload');
   const hiddenUpload = document.getElementById('hiddenUpload');
@@ -558,13 +627,40 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
   const fmCreateDir = document.getElementById('fmCreateDir');
   const fmPath = document.getElementById('fmPath');
 
+  const editorPath = document.getElementById('editorPath');
+  const editorContent = document.getElementById('editorContent');
+  const fileSave = document.getElementById('fileSave');
+  const fileUnzip = document.getElementById('fileUnzip');
+  const fileDelete = document.getElementById('fileDelete');
+  const fileClear = document.getElementById('fileClear');
+  const fileDownload = document.getElementById('fileDownload');
+  const downloadZip = document.getElementById('downloadZip');
+
+  const hostPath = document.getElementById('hostPath');
+  const hostStart = document.getElementById('hostStart');
+  const hostStop = document.getElementById('hostStop');
+  const hostOutput = document.getElementById('hostOutput');
+  const hostClear = document.getElementById('hostClear');
+
+  // Terminal modal elements
+  const termModal = document.getElementById('termModal');
+  const openTerminalBtn = document.getElementById('navTerminal');
+  const termConnect = document.getElementById('termConnect');
+  const termClose = document.getElementById('termClose');
+  const tokenInput = document.getElementById('tokenInput');
+  const termStatus = document.getElementById('termStatus');
+  const termIdLabel = document.getElementById('termIdLabel');
+  const termKill = document.getElementById('termKill');
+  const termClear = document.getElementById('termClear');
   const xtermContainer = document.getElementById('xterm');
+
   let term = null;
   let fitAddon = null;
   let currentTermId = null;
 
   let currentRunnerJob = null;
   let currentPipJob = null;
+  let hostJobId = null;
   const activeJobs = {};
 
   function appendGlobal(txt){
@@ -574,6 +670,14 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
   function appendRunner(txt){
     runnerOutput.textContent += txt;
     runnerOutput.scrollTop = runnerOutput.scrollHeight;
+  }
+  function appendPip(txt){
+    pipOutput.textContent += txt;
+    pipOutput.scrollTop = pipOutput.scrollHeight;
+  }
+  function appendHost(txt){
+    hostOutput.textContent += txt;
+    hostOutput.scrollTop = hostOutput.scrollHeight;
   }
 
   // Socket events
@@ -586,7 +690,8 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     const out = `[${m.job_id}][${m.stream}] ${m.text}`;
     appendGlobal(out);
     if (currentRunnerJob && m.job_id === currentRunnerJob) appendRunner(m.text);
-    if (currentPipJob && m.job_id === currentPipJob) appendGlobal(m.text);
+    if (currentPipJob && m.job_id === currentPipJob) appendPip(m.text);
+    if (hostJobId && m.job_id === hostJobId) appendHost(m.text);
   });
 
   socket.on('proc.start', (m) => {
@@ -599,6 +704,7 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     appendGlobal(`[exit ${m.job_id}] code=${m.code}\\n`);
     if (currentRunnerJob === m.job_id) currentRunnerJob = null;
     if (currentPipJob === m.job_id) currentPipJob = null;
+    if (hostJobId === m.job_id) hostJobId = None;
     activeJobs[m.job_id] = {...(activeJobs[m.job_id]||{}), exit: m.code};
     renderJobs();
   });
@@ -628,11 +734,9 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     currentTermId = m.term_id;
     termIdLabel.textContent = m.term_id;
     termStatus.textContent = 'Connected';
-    // Hook xterm to send input events
     term.onData(data => {
       socket.emit('term.input', {term_id: currentTermId, data});
     });
-    // send resize
     setTimeout(()=> {
       fitAddon.fit();
       socket.emit('term.resize', {term_id: currentTermId, cols: term.cols, rows: term.rows});
@@ -664,12 +768,8 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     termStatus.textContent = 'Token required';
   });
 
-  // UI actions
-  openTerminalBtn.addEventListener('click', () => {
-    showTermModal();
-  });
-
-  function showTermModal(){
+  // UI actions - Terminal
+  function openTerminalModal(){
     termModal.style.display = 'flex';
     if (!term) {
       term = new Terminal();
@@ -684,7 +784,9 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     termIdLabel.textContent = '';
   }
 
-  termClose.addEventListener('click', () => {
+  document.getElementById('navTerminal').addEventListener('click', openTerminalModal);
+
+  document.getElementById('termClose').addEventListener('click', () => {
     termModal.style.display = 'none';
     if (currentTermId) {
       socket.emit('term.disconnect', {term_id: currentTermId});
@@ -692,19 +794,19 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     }
   });
 
-  termConnect.addEventListener('click', () => {
+  document.getElementById('termConnect').addEventListener('click', () => {
     const token = tokenInput.value.trim();
     socket.emit('term.request', {token});
   });
 
-  termKill.addEventListener('click', () => {
+  document.getElementById('termKill').addEventListener('click', () => {
     if (!currentTermId) return;
     socket.emit('term.kill', {term_id: currentTermId});
   });
 
-  termClear.addEventListener('click', () => { if (term) term.clear(); });
+  document.getElementById('termClear').addEventListener('click', () => { if (term) term.clear(); });
 
-  // Runner
+  // Runner actions
   runnerRun.addEventListener('click', () => {
     const code = document.getElementById('runnerCode').value;
     const timeout = parseInt(runnerTimeout.value) || 60;
@@ -717,6 +819,13 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     if (!currentRunnerJob) return;
     socket.emit('stop.process', {job_id: currentRunnerJob});
   });
+  runnerClear.addEventListener('click', ()=> { runnerOutput.textContent=''; });
+  runnerSend.addEventListener('click', ()=> {
+    const text = runnerStdIn.value;
+    if (!currentRunnerJob || !text) return;
+    socket.emit('proc.input', {job_id: currentRunnerJob, data: text + '\\n'});
+    runnerStdIn.value = '';
+  });
 
   // Commands
   cmdRun.addEventListener('click', () => runCmd());
@@ -728,9 +837,43 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
     socket.emit('run.command', {cmd, cwd});
     cmdInput.value = '';
   }
+  cmdClear.addEventListener('click', ()=> { globalOutput.textContent=''; });
+
+  document.getElementById('globalSend').addEventListener('click', ()=> {
+    const text = document.getElementById('globalStdIn').value;
+    if (!text) return;
+    // If job id included at start like "<jobid> some input" allow it, else use last active job
+    const parts = text.trim().split(' ');
+    let jobId = null;
+    if (parts[0] && parts[0].length > 10 && activeJobs[parts[0]]) {
+      jobId = parts.shift();
+    } else {
+      // pick last active job
+      const keys = Object.keys(activeJobs || {});
+      if (keys.length) jobId = keys[keys.length - 1];
+    }
+    if (!jobId) { alert('No job to send to'); return; }
+    const payload = parts.join(' ');
+    socket.emit('proc.input', {job_id: jobId, data: payload + '\\n'});
+    document.getElementById('globalStdIn').value = '';
+  });
+
+  // Pip installer
+  pipInstall.addEventListener('click', ()=> {
+    const pkg = pipPkg.value.trim();
+    if (!pkg) return alert('Provide package or -r requirements.txt');
+    pipOutput.textContent = '';
+    if (pkg === '-r' || pkg === '-r requirements.txt' || pkg.endsWith('.txt')) {
+      // prefer server-side requirements handler if they pass '-r' or a requirements file
+      socket.emit('pip.install.requirements', {});
+    } else {
+      socket.emit('pip.install', {pkg});
+    }
+  });
+  pipClear.addEventListener('click', ()=> { pipOutput.textContent=''; });
 
   // File manager
-  fmUpload.addEventListener('click', ()=> hiddenUpload.click());
+  document.getElementById('fmUpload').addEventListener('click', ()=> hiddenUpload.click());
   hiddenUpload.addEventListener('change', async (ev) => {
     const files = Array.from(ev.target.files);
     if (!files.length) return;
@@ -743,18 +886,39 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
 
   fmCreateFile.addEventListener('click', ()=> {
     const p = fmPath.value.trim(); if (!p) return alert('Provide path');
-    fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p, type:'file'})}).then(r=> { if (r.ok) loadTree(); else alert('Failed'); });
+    fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p, type:'file'})}).then(r=> { if (r.ok) loadTree(); else r.json().then(x=>alert(JSON.stringify(x))); });
   });
   fmCreateDir.addEventListener('click', ()=> {
     const p = fmPath.value.trim(); if (!p) return alert('Provide path');
-    fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p, type:'dir'})}).then(r=> { if (r.ok) loadTree(); else alert('Failed'); });
+    fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:p, type:'dir'})}).then(r=> { if (r.ok) loadTree(); else r.json().then(x=>alert(JSON.stringify(x))); });
   });
   fmRefresh.addEventListener('click', loadTree);
+
+  downloadZip.addEventListener('click', ()=> {
+    window.location = '/api/download?zip=1';
+  });
 
   async function loadTree(){
     const res = await fetch('/api/tree');
     const j = await res.json();
     fileTree.innerHTML = renderTree(j.tree, '');
+    // wire file links
+    Array.from(document.getElementsByClassName('file-link')).forEach(el => {
+      el.onclick = async (ev) => {
+        ev.preventDefault();
+        const p = el.getAttribute('data-path');
+        editorPath.value = p;
+        const r = await fetch('/api/file', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:p})});
+        const j2 = await r.json();
+        if (j2.type === 'text') {
+          editorContent.value = j2.content;
+        } else if (j2.type === 'dir') {
+          editorContent.value = '[directory]';
+        } else {
+          editorContent.value = '[binary or unreadable]';
+        }
+      };
+    });
   }
 
   function renderTree(tree, prefix){
@@ -766,11 +930,64 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
         if (node.children && node.children.length) html += `<div style="margin-left:12px">${renderTree(node.children, rel)}</div>`;
         html += `</div>`;
       } else {
-        html += `<div style="padding:6px" class="small">📄 <a href="#" onclick="return false" data-path="${rel}" class="file-link">${node.name}</a></div>`;
+        html += `<div style="padding:6px" class="file-row small">📄 <a href="#" onclick="return false" data-path="${rel}" class="file-link">${node.name}</a> <div><button data-path="${rel}" class="button small-btn dl-btn">DL</button></div></div>`;
       }
     }
     return html;
   }
+
+  // download per-file handlers (delegated)
+  fileTree.addEventListener('click', (ev)=> {
+    const b = ev.target.closest('.dl-btn');
+    if (!b) return;
+    const p = b.getAttribute('data-path');
+    if (!p) return;
+    window.location = '/api/download?path=' + encodeURIComponent(p);
+  });
+
+  fileSave.addEventListener('click', async ()=> {
+    const p = editorPath.value.trim();
+    if (!p) return alert('Provide path');
+    const content = editorContent.value;
+    const res = await fetch('/api/save', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:p, content})});
+    if (res.ok) { alert('Saved'); loadTree(); } else { const j = await res.json(); alert(JSON.stringify(j)); }
+  });
+
+  fileUnzip.addEventListener('click', async ()=> {
+    const p = editorPath.value.trim();
+    if (!p) return alert('Provide zip path');
+    const res = await fetch('/api/unzip', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:p})});
+    const j = await res.json();
+    if (res.ok) { alert('Unzipped'); loadTree(); } else { alert(JSON.stringify(j)); }
+  });
+
+  fileDelete.addEventListener('click', async ()=> {
+    const p = editorPath.value.trim();
+    if (!p) return alert('Provide path');
+    if (!confirm('Delete ' + p + '?')) return;
+    const res = await fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({path:p})});
+    const j = await res.json();
+    if (res.ok) { alert('Deleted'); loadTree(); editorContent.value=''; editorPath.value=''; } else { alert(JSON.stringify(j)); }
+  });
+
+  fileClear.addEventListener('click', ()=> { editorContent.value=''; });
+  fileDownload.addEventListener('click', ()=> {
+    const p = editorPath.value.trim();
+    if (!p) return alert('Select file');
+    window.location = '/api/download?path=' + encodeURIComponent(p);
+  });
+
+  // Host controls
+  hostStart.addEventListener('click', ()=> {
+    const p = hostPath.value.trim();
+    if (!p) return alert('Provide script path');
+    // send host.start via socket
+    socket.emit('host.start', {path: p});
+  });
+  hostStop.addEventListener('click', ()=> {
+    socket.emit('host.stop', {});
+  });
+  hostClear.addEventListener('click', ()=> { hostOutput.textContent=''; });
 
   // job list
   function renderJobs(){
@@ -784,18 +1001,34 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
       div.style.display='flex'; div.style.justifyContent='space-between'; div.style.alignItems='center'; div.style.padding='6px'; div.style.borderBottom='1px solid rgba(255,255,255,0.02)';
       const left = document.createElement('div'); left.style.fontFamily='monospace'; left.textContent = k;
       const right = document.createElement('div');
-      const stop = document.createElement('button'); stop.className='button'; stop.textContent='Stop'; stop.onclick = ()=> socket.emit('stop.process', {job_id:k});
-      right.appendChild(stop);
+      const stop = document.createElement('button'); stop.className='button small-btn'; stop.textContent='Stop'; stop.onclick = ()=> socket.emit('stop.process', {job_id:k});
+      const send = document.createElement('button'); send.className='button small-btn'; send.textContent='Send'; send.onclick = ()=> {
+        const txt = prompt('Send stdin to job ' + k);
+        if (txt) socket.emit('proc.input', {job_id: k, data: txt + '\\n'});
+      };
+      right.appendChild(send); right.appendChild(stop);
       div.appendChild(left); div.appendChild(right);
       el.appendChild(div);
     }
   }
 
-  // helper to expose activeJobs updates from socket handlers
   socket.on('proc.start', (m) => { activeJobs[m.job_id] = m; renderJobs(); });
   socket.on('proc.exit', (m) => { if (activeJobs[m.job_id]) activeJobs[m.job_id].exit = m.code; renderJobs(); });
 
-  // initial
+  // handler for host notifications
+  socket.on('host.started', (m) => {
+    hostJobId = m.job_id;
+    appendHost('[host started ' + m.job_id + ']\\n');
+  });
+  socket.on('host.stopped', (m) => {
+    appendHost('[host stopped]\\n');
+    hostJobId = null;
+  });
+
+  // proc input (for processes with stdin)
+  // backend writes to process.stdin when receiving 'proc.input' socket events
+
+  // initial load
   loadTree();
 
 })();
@@ -805,11 +1038,15 @@ html,body{height:100%;margin:0;background:linear-gradient(180deg,var(--bg),#0210
 """
 
 # ----------------------
-# Flask API endpoints
+# Flask API endpoints (keep original functionality, add safe helpers)
 # ----------------------
 @app.route("/")
+@app.route("/terminal")
+@app.route("/file-manager")
 def index():
-    return render_template_string(INDEX_HTML.replace("{{WORKDIR}}", WORKDIR).replace("{{ 'true' if TERMINAL_TOKEN else 'false' }}", "true" if TERMINAL_TOKEN else "false"))
+    return render_template_string(
+        INDEX_HTML.replace("{{WORKDIR}}", WORKDIR).replace("{{ 'true' if TERMINAL_TOKEN else 'false' }}", "true" if TERMINAL_TOKEN else "false")
+    )
 
 
 @app.route("/api/tree")
@@ -924,10 +1161,49 @@ def api_file():
         return jsonify({"type": "binary"})
 
 
+@app.route("/api/save", methods=["POST"])
+def api_save():
+    data = request.get_json() or {}
+    path = data.get("path")
+    content = data.get("content", "")
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    try:
+        full = safe_join(WORKDIR, path)
+    except Exception:
+        return jsonify({"error": "Invalid path"}), 400
+    try:
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        with open(full, "w", encoding="utf-8") as f:
+            f.write(content)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/api/unzip", methods=["POST"])
+def api_unzip():
+    data = request.get_json() or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"error": "Missing path"}), 400
+    try:
+        full = safe_join(WORKDIR, path)
+    except Exception:
+        return jsonify({"error": "Invalid path"}), 400
+    if not os.path.exists(full):
+        return jsonify({"error": "Not found"}), 404
+    try:
+        with zipfile.ZipFile(full, "r") as zf:
+            zf.extractall(os.path.dirname(full))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+    return jsonify({"ok": True})
+
+
 @app.route("/api/download")
 def api_download():
     if request.args.get("zip"):
-        import zipfile
         mem = io.BytesIO()
         with zipfile.ZipFile(mem, "w", zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(WORKDIR):
@@ -1006,7 +1282,11 @@ def on_pip_install_requirements(_msg):
 def on_run_paste(msg):
     sid = request.sid
     code = msg.get("code", "")
-    timeout = int(msg.get("timeout") or DEFAULT_TIMEOUT)
+    timeout = msg.get("timeout")
+    try:
+        timeout = int(timeout) if timeout is not None else DEFAULT_TIMEOUT
+    except Exception:
+        timeout = DEFAULT_TIMEOUT
     if not code:
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": "No code provided\n"}, room=sid)
         return
@@ -1021,7 +1301,8 @@ def on_run_paste(msg):
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": f"Failed to write temp file: {e}\n"}, room=sid)
         return
     cmd = [sys.executable, full]
-    job_id = start_subprocess(cmd, run_dir, sid, timeout=timeout)
+    # support timeout=0 meaning no timeout
+    job_id = start_subprocess(cmd, run_dir, sid, timeout=(0 if timeout == 0 else timeout))
     emit("run.paste.job", {"job_id": job_id, "cmd": cmd}, room=sid)
 
 
@@ -1039,6 +1320,35 @@ def on_stop_process(msg):
         emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": f"Failed to stop {job_id}\n"}, room=sid)
 
 
+@socketio.on("proc.input")
+def on_proc_input(msg):
+    """
+    Write provided data to a running subprocess's stdin (if available).
+    msg: {"job_id": str, "data": str}
+    """
+    sid = request.sid
+    job_id = msg.get("job_id")
+    data = msg.get("data", "")
+    if not job_id or data is None:
+        emit("proc.output", {"job_id": None, "stream": "stderr", "text": "Missing job_id or data\n"}, room=sid)
+        return
+    with process_lock:
+        meta = processes.get(job_id)
+    if not meta:
+        emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": "Job not found\n"}, room=sid)
+        return
+    p: subprocess.Popen = meta["proc"]
+    try:
+        if p.stdin:
+            p.stdin.write(data.encode())
+            p.stdin.flush()
+            emit("proc.output", {"job_id": job_id, "stream": "stdout", "text": f"[stdin sent] {data}"}, room=sid)
+        else:
+            emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": "No stdin for process\n"}, room=sid)
+    except Exception as e:
+        emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": f"Failed to write stdin: {e}\n"}, room=sid)
+
+
 # ----------------------
 # SocketIO handlers for integrated terminal (PTY)
 # ----------------------
@@ -1051,7 +1361,6 @@ def on_term_request(message):
             emit("term.token.required", {"msg": "Invalid token"}, room=sid)
             return
     term_id = str(uuid.uuid4())
-    # spawn PTY-backed shell safely (uses pty.openpty + subprocess)
     ok = spawn_pty_process(term_id, sid, cols=80, rows=24)
     if ok:
         emit("term.ready", {"term_id": term_id}, room=sid)
@@ -1105,6 +1414,44 @@ def on_term_disconnect(message):
     with term_lock:
         terminals.pop(term_id, None)
     emit("term.exit", {"term_id": term_id}, room=request.sid)
+
+
+# ----------------------
+# Host (start a persistent script)
+# ----------------------
+@socketio.on("host.start")
+def on_host_start(message):
+    sid = request.sid
+    path = (message or {}).get("path", "").strip()
+    if not path:
+        emit("proc.output", {"job_id": None, "stream": "stderr", "text": "Missing host path\n"}, room=sid)
+        return
+    try:
+        full = safe_join(WORKDIR, path)
+    except Exception:
+        emit("proc.output", {"job_id": None, "stream": "stderr", "text": "Invalid path\n"}, room=sid)
+        return
+    if not os.path.exists(full):
+        emit("proc.output", {"job_id": None, "stream": "stderr", "text": "Not found\n"}, room=sid)
+        return
+    cmd = [sys.executable, full]
+    # no timeout (0)
+    job_id = start_subprocess(cmd, os.path.dirname(full) or WORKDIR, sid, timeout=0)
+    emit("host.started", {"job_id": job_id}, room=sid)
+
+
+@socketio.on("host.stop")
+def on_host_stop(_message):
+    sid = request.sid
+    # attempt to stop any process that was started as host (best-effort)
+    with process_lock:
+        # heuristic: hosted jobs are ones with timeout None and cwd in workspace (or where cmd points to a file)
+        hosted = [k for k, v in processes.items() if v.get("timeout") is None]
+    ok_any = False
+    for k in hosted:
+        ok = stop_subprocess(k)
+        ok_any = ok_any or ok
+    emit("host.stopped", {"ok": ok_any}, room=sid)
 
 
 # ----------------------
