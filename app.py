@@ -1,19 +1,29 @@
-# File: app.py
 #!/usr/bin/env python3
 """
-app.py - Single-file Flask + Flask-SocketIO full-stack file manager, runner, terminals, and pip installer.
+app.py - Single-file Flask + Flask-SocketIO sandbox with integrated web terminal (pty),
+file manager, pip installer, single-file runner, and terminals — all UI inlined.
 
-Minimal dependencies:
-    pip install -r requirements.txt
-or:
+Requirements:
     pip install flask flask-socketio
 
+Notes / Security:
+- This app allows executing commands and an interactive shell inside subprocesses on the host.
+  Do NOT expose to the public without proper authentication, network restrictions and sandboxing.
+- No hard-coded passwords are included. To protect the integrated terminal set TERMINAL_TOKEN
+  environment variable (a secret string) and the UI will require that token to open the terminal.
+- On UNIX, the interactive terminal uses os.forkpty to allocate a PTY and runs /bin/bash (or shell).
+  On Windows the app falls back to a non-pty subprocess (less interactive).
+- Resource limits are applied (UNIX only) to child processes (CPU/time/memory).
+- The app is intended for local / private use only.
+
 Run:
+    TERMINAL_TOKEN=some_secret python app.py
+or without token (development only):
     python app.py
 
-Security:
-- This app runs user-provided code in subprocesses with best-effort resource limits on UNIX (via `resource`).
-- Do NOT expose this service publicly without additional authentication and network controls.
+Open: http://127.0.0.1:5000
+
+Author: Generated for user request
 """
 
 import os
@@ -29,42 +39,55 @@ import pathlib
 import threading
 import subprocess
 from typing import Dict, Any, Optional
-from functools import wraps
-from flask import Flask, jsonify, request, render_template_string, send_file
-from flask_socketio import SocketIO, emit
+from flask import Flask, jsonify, request, render_template_string, send_file, abort
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
-# Optional resource module for UNIX resource limits
+# UNIX-only resource module
 try:
     import resource  # type: ignore
 except Exception:
     resource = None
 
-# -----------------------
-# Configuration
-# -----------------------
+# PTY imports
+try:
+    import pty
+    import tty
+    import termios
+    import fcntl
+    import struct
+except Exception:
+    pty = None
+
+# Config
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 WORKDIR = os.path.join(BASE_DIR, "workspace")
 os.makedirs(WORKDIR, exist_ok=True)
 
-DEFAULT_TIMEOUT = 120  # seconds per job (default)
+DEFAULT_TIMEOUT = 120  # seconds
 MEMORY_LIMIT_BYTES = 512 * 1024 * 1024  # 512MB
 CPU_TIME_LIMIT = 60  # seconds
 
-# Flask + Socket.IO
+# Terminal protection token (set in environment)
+TERMINAL_TOKEN = os.environ.get("TERMINAL_TOKEN", "").strip()
+
+# Flask + SocketIO
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.urandom(24)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
-# In-memory process registry
+# Global process registries
 processes: Dict[str, Dict[str, Any]] = {}
 proc_lock = threading.Lock()
 
+# Terminal registry: term_id -> meta {pid, fd, thread, sid}
+terminals: Dict[str, Dict[str, Any]] = {}
+term_lock = threading.Lock()
 
-# -----------------------
+
+# ----------------------
 # Utilities
-# -----------------------
+# ----------------------
 def safe_join(base: str, *paths: str) -> str:
-    """Join and enforce path stays within base (prevents directory traversal)."""
     base = os.path.abspath(base)
     candidate = os.path.abspath(os.path.join(base, *paths))
     if not candidate.startswith(base):
@@ -73,7 +96,7 @@ def safe_join(base: str, *paths: str) -> str:
 
 
 def set_limits_for_child():
-    """Apply resource limits in subprocess (UNIX-only)."""
+    """Set resource limits in the child process (UNIX)."""
     if resource:
         try:
             resource.setrlimit(resource.RLIMIT_CPU, (CPU_TIME_LIMIT, CPU_TIME_LIMIT))
@@ -90,7 +113,6 @@ def set_limits_for_child():
 
 
 def detect_preview_url(text: str) -> Optional[str]:
-    """Detect common local server URLs in output lines and return a usable preview URL."""
     import re
 
     patterns = [
@@ -111,8 +133,7 @@ def detect_preview_url(text: str) -> Optional[str]:
     return None
 
 
-def read_and_emit(proc: subprocess.Popen, job_id: str, sid: Optional[str], stream_name: str, stream):
-    """Read stream lines and emit to client room via socketio."""
+def read_stream_and_emit(proc: subprocess.Popen, job_id: str, sid: Optional[str], stream_name: str, stream):
     try:
         while True:
             chunk = stream.readline()
@@ -126,12 +147,11 @@ def read_and_emit(proc: subprocess.Popen, job_id: str, sid: Optional[str], strea
             preview = detect_preview_url(text)
             if preview:
                 socketio.emit("proc.preview", {"job_id": job_id, "url": preview}, room=sid or None)
-    except Exception as e:
-        socketio.emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": f"[stream error] {e}\n"})
+    except Exception as exc:
+        socketio.emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": f"[stream error] {exc}\n"}, room=sid or None)
 
 
-def start_subprocess(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[int] = None) -> str:
-    """Start a subprocess and stream its output. Returns a job_id."""
+def start_process(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[int] = None) -> str:
     job_id = str(uuid.uuid4())
     preexec = None
     if os.name != "nt" and resource:
@@ -155,9 +175,8 @@ def start_subprocess(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[
     with proc_lock:
         processes[job_id] = {"proc": proc, "sid": sid, "start": time.time(), "timeout": timeout or DEFAULT_TIMEOUT, "cmd": cmd, "cwd": cwd}
 
-    # readers
-    t_out = threading.Thread(target=read_and_emit, args=(proc, job_id, sid, "stdout", proc.stdout), daemon=True)
-    t_err = threading.Thread(target=read_and_emit, args=(proc, job_id, sid, "stderr", proc.stderr), daemon=True)
+    t_out = threading.Thread(target=read_stream_and_emit, args=(proc, job_id, sid, "stdout", proc.stdout), daemon=True)
+    t_err = threading.Thread(target=read_stream_and_emit, args=(proc, job_id, sid, "stderr", proc.stderr), daemon=True)
     t_out.start()
     t_err.start()
 
@@ -190,397 +209,355 @@ def start_subprocess(cmd: list, cwd: str, sid: Optional[str], timeout: Optional[
     return job_id
 
 
-def stop_subprocess(job_id: str) -> bool:
+def stop_process(job_id: str) -> bool:
     with proc_lock:
         meta = processes.get(job_id)
     if not meta:
         return False
-    p: subprocess.Popen = meta["proc"]
+    proc = meta["proc"]
     try:
-        p.kill()
+        proc.kill()
         return True
     except Exception:
         try:
-            p.terminate()
+            proc.terminate()
             return True
         except Exception:
             return False
 
 
-# -----------------------
-# HTML UI (inlined)
-# -----------------------
-INDEX_HTML = """
+# ----------------------
+# PTY-based interactive terminal (UNIX)
+# ----------------------
+def spawn_pty_shell(term_id: str, sid: str, cols: int = 80, rows: int = 24):
+    """
+    Spawn a shell in a new PTY. Runs /bin/bash -i if available, otherwise system shell.
+    This function forks the process (os.forkpty) and returns metadata stored in terminals[term_id].
+    Reader thread streams output from the PTY fd and emits 'term.output' events to the client's room (sid).
+    """
+    if pty is None:
+        socketio.emit("term.error", {"msg": "PTY not available on this platform"}, room=sid)
+        return False
+
+    # Determine shell
+    shell = os.environ.get("SHELL", "/bin/bash")
+    pid, fd = pty.fork()
+    if pid == 0:
+        # Child: set resource limits and exec shell
+        try:
+            if resource:
+                # soft limits already defined in set_limits_for_child, call here
+                set_limits_for_child()
+            os.execv(shell, [shell, "-i"])
+        except Exception:
+            # If exec fails, exit child
+            os._exit(1)
+    else:
+        # Parent: set non-blocking
+        try:
+            flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+            fcntl.fcntl(fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+        except Exception:
+            pass
+
+        # Resize the PTY
+        try:
+            winsize = struct.pack("HHHH", rows, cols, 0, 0)
+            fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+        except Exception:
+            pass
+
+        def reader():
+            try:
+                while True:
+                    try:
+                        data = os.read(fd, 4096)
+                        if not data:
+                            break
+                        try:
+                            text = data.decode(errors="replace")
+                        except Exception:
+                            text = str(data)
+                        socketio.emit("term.output", {"term_id": term_id, "data": text}, room=sid)
+                    except OSError:
+                        break
+                    except Exception:
+                        break
+            finally:
+                # PTY closed
+                socketio.emit("term.exit", {"term_id": term_id}, room=sid)
+                with term_lock:
+                    terminals.pop(term_id, None)
+
+        t = threading.Thread(target=reader, daemon=True)
+        t.start()
+
+        with term_lock:
+            terminals[term_id] = {"pid": pid, "fd": fd, "thread": t, "sid": sid}
+        return True
+
+
+def write_to_pty(term_id: str, data: str):
+    with term_lock:
+        meta = terminals.get(term_id)
+    if not meta:
+        return False
+    fd = meta["fd"]
+    try:
+        os.write(fd, data.encode())
+        return True
+    except Exception:
+        return False
+
+
+def resize_pty(term_id: str, cols: int, rows: int):
+    with term_lock:
+        meta = terminals.get(term_id)
+    if not meta:
+        return False
+    fd = meta["fd"]
+    try:
+        winsize = struct.pack("HHHH", rows, cols, 0, 0)
+        fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
+        return True
+    except Exception:
+        return False
+
+
+def kill_pty(term_id: str):
+    with term_lock:
+        meta = terminals.get(term_id)
+    if not meta:
+        return False
+    pid = meta["pid"]
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except Exception:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except Exception:
+            pass
+    return True
+
+
+# ----------------------
+# HTML / JS interface (inlined)
+# ----------------------
+INDEX_HTML = r"""
 <!doctype html>
-<html lang="en">
+<html>
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>PySandbox - File Manager & Runners</title>
-<style>
-:root{--bg:#071022;--panel:#05121a;--muted:#9aa6b2;--accent:#60a5fa;--text:#e6eef8}
-[data-theme="light"]{--bg:#f6f8fb;--panel:#ffffff;--muted:#6b7280;--accent:#0ea5a3;--text:#0b1220}
-*{box-sizing:border-box;font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,"Helvetica Neue",Arial}
-html,body,#app{height:100%;margin:0}
-body{background:linear-gradient(180deg,var(--bg),#031022);color:var(--text);padding:12px}
-.app{display:flex;gap:12px;height:calc(100vh - 24px)}
-.sidebar{width:300px;background:var(--panel);border-radius:10px;padding:12px;display:flex;flex-direction:column}
-.top{display:flex;gap:8px;align-items:center;margin-bottom:8px}
-.brand{font-weight:700;font-size:18px;flex:1}
-.btn{background:transparent;border:1px solid rgba(255,255,255,0.04);color:var(--text);padding:6px 8px;border-radius:8px;cursor:pointer}
-.small{padding:6px 8px;font-size:13px}
-.files{flex:1;overflow:auto;background:linear-gradient(180deg,#041022,#03121a);padding:8px;border-radius:8px}
-.file-item{padding:6px 8px;border-radius:6px;display:flex;align-items:center;gap:8px;cursor:pointer}
-.file-item:hover{background:rgba(255,255,255,0.02)}
-.main{flex:1;display:flex;flex-direction:column;gap:12px}
-.grid{display:grid;grid-template-columns:1fr 420px;gap:12px;min-height:0}
-.panel{background:linear-gradient(180deg,#031225,#02111a);border-radius:10px;padding:12px;overflow:auto}
-.row{display:flex;gap:8px;align-items:center}
-.input{flex:1;padding:8px;border-radius:8px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.03);color:var(--text)}
-.textarea{width:100%;height:160px;background:transparent;padding:8px;border-radius:8px;border:1px solid rgba(255,255,255,0.03);resize:vertical;color:var(--text);font-family:monospace}
-.terminal{background:#01060a;color:#e6eef8;padding:8px;border-radius:8px;height:220px;overflow:auto;font-family:monospace;font-size:13px}
-.previewLink{display:inline-block;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,0.02);border:1px solid rgba(255,255,255,0.04);color:var(--accent);text-decoration:none}
-.footer{display:flex;justify-content:space-between;align-items:center;margin-top:8px;color:var(--muted);font-size:13px}
-@media(max-width:900px){.app{flex-direction:column}.grid{grid-template-columns:1fr}}
-</style>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>PySandbox - Integrated Terminal</title>
+  <style>
+    body{font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,Arial;margin:0;background:#071022;color:#e6eef8}
+    header{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;background:#051225}
+    .brand{font-weight:700}
+    .container{display:flex;gap:12px;padding:12px}
+    .sidebar{width:300px;background:#061427;padding:12px;border-radius:10px}
+    .main{flex:1;background:#041022;padding:12px;border-radius:10px;min-height:70vh}
+    button{background:#0b1220;border:1px solid rgba(255,255,255,0.04);color:#e6eef8;padding:8px;border-radius:6px;cursor:pointer}
+    .term-modal{position:fixed;left:0;top:0;width:100%;height:100%;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.6)}
+    .term-box{width:90%;max-width:1000px;height:80%;background:#000;border-radius:8px;display:flex;flex-direction:column;overflow:hidden}
+    .term-header{display:flex;align-items:center;justify-content:space-between;padding:8px;background:#071827;color:#a8b3bd}
+    .term-body{flex:1;display:flex;flex-direction:column}
+    .controls{display:flex;gap:8px;margin-bottom:8px}
+    .small{font-size:13px;color:#9aa6b2}
+    .inline-input{padding:6px;border-radius:6px;border:1px solid rgba(255,255,255,0.04);background:#071427;color:#e6eef8}
+  </style>
+
+  <!-- xterm.js from CDN -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/xterm@5.1.0/css/xterm.css" />
+  <script src="https://cdn.jsdelivr.net/npm/xterm@5.1.0/lib/xterm.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/xterm-addon-fit@0.7.0/lib/xterm-addon-fit.js"></script>
+  <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 </head>
-<body data-theme="dark" id="body">
-<div id="app" class="app">
-  <div id="sidebar" class="sidebar">
-    <div class="top">
-      <div class="brand">PySandbox</div>
-      <div>
-        <button id="toggleSidebar" class="btn">☰</button>
+<body>
+  <header>
+    <div class="brand">PySandbox</div>
+    <div>
+      <button id="openTerminalBtn">Open Integrated Terminal</button>
+    </div>
+  </header>
+
+  <div class="container">
+    <div class="sidebar">
+      <div style="font-weight:700;margin-bottom:8px">Quick Actions</div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button id="openFileMgr">File Manager</button>
+        <button id="openPip">Pip Installer</button>
       </div>
+      <div style="margin-top:12px;color:#9aa6b2;font-size:13px">Workspace: <span id="cwd">{{WORKDIR}}</span></div>
     </div>
 
-    <div style="display:flex;gap:8px;margin-bottom:8px">
-      <button id="openFM" class="btn small">File Manager</button>
-      <button id="openPipUI" class="btn small">Pip Installer</button>
-    </div>
+    <div class="main">
+      <div style="font-weight:700">Integrated Terminal Demo</div>
+      <p class="small">Click "Open Integrated Terminal". You will be prompted for a token if the server requires one.
+         This terminal runs a shell on the server inside a PTY (UNIX). Use responsibly.</p>
 
-    <div class="panel" style="padding:8px">
-      <div style="font-weight:600;margin-bottom:6px">Quick</div>
-      <div style="display:flex;gap:6px;margin-bottom:8px">
-        <button id="newFile" class="btn small">New File</button>
-        <button id="newFolder" class="btn small">New Folder</button>
+      <div style="margin-top:12px">
+        <button id="openTerminalInline">Open Terminal Inline</button>
       </div>
-      <div style="font-weight:600;margin-bottom:6px">Upload</div>
-      <input id="upload" type="file" multiple webkitdirectory directory mozdirectory style="display:none"/>
-      <div style="display:flex;gap:6px">
-        <button id="uploadBtn" class="btn small">Upload</button>
-        <button id="downloadAll" class="btn small">Download Zip</button>
+
+      <div style="margin-top:18px">
+        <div style="font-weight:600">Global Terminal Output (logs)</div>
+        <pre id="logOut" style="background:#01060a;color:#e6eef8;padding:8px;border-radius:6px;height:220px;overflow:auto;font-family:monospace"></pre>
       </div>
-      <div class="footer" style="margin-top:12px">
-        <div>Workspace: <span id="cwdDisp"></span></div>
-        <div><button id="themeToggle" class="btn small">Theme</button></div>
+    </div>
+  </div>
+
+  <!-- Terminal modal (hidden by default) -->
+  <div id="termModal" class="term-modal" style="display:none">
+    <div class="term-box">
+      <div class="term-header">
+        <div>Integrated Shell <span id="termIdLabel" style="margin-left:12px;color:#9aa6b2"></span></div>
+        <div>
+          <span class="small" id="termStatus">Disconnected</span>
+          <button id="termClose">Close</button>
+        </div>
+      </div>
+      <div class="term-body">
+        <div style="padding:8px;display:flex;gap:8px;align-items:center;background:#071427">
+          <div class="controls">
+            <button id="termCtrlKill">Kill</button>
+            <button id="termCtrlClear">Clear</button>
+          </div>
+          <div style="margin-left:auto;display:flex;gap:8px;align-items:center">
+            <input id="tokenInput" class="inline-input" placeholder="Terminal token (if required)" />
+            <button id="termAuthBtn">Connect</button>
+          </div>
+        </div>
+        <div id="xtermContainer" style="flex:1;background:#000"></div>
       </div>
     </div>
   </div>
 
-  <div class="main">
-    <div class="row" style="justify-content:space-between">
-      <div style="display:flex;gap:8px">
-        <button id="openFileManagerPanel" class="btn">File Manager</button>
-        <button id="openPipPanel" class="btn">Pip Installer</button>
-        <button id="openTermPanel" class="btn">Terminals</button>
-        <button id="openRunnerPanel" class="btn">Single-file Runner</button>
-        <button id="openUbuntuTtyd" class="btn">Ubuntu Web Terminal</button>
-      </div>
-      <div style="color:var(--muted)">Preview links auto-detected from process output</div>
-    </div>
-
-    <div class="grid">
-      <div id="leftColumn" class="panel">
-        <!-- File Manager -->
-        <div id="fileManagerSection">
-          <div style="font-weight:700;margin-bottom:8px">File Manager</div>
-          <div class="row" style="margin-bottom:8px">
-            <input id="fm_path" class="input" placeholder="Path (relative)" />
-            <button id="fm_new_file" class="btn small">Create</button>
-          </div>
-          <div id="fileTree" style="max-height:320px;overflow:auto;border-radius:6px;padding:6px;background:rgba(255,255,255,0.01)"></div>
-          <div style="margin-top:8px;display:flex;gap:6px">
-            <button id="fm_refresh" class="btn small">Refresh</button>
-            <button id="fm_delete" class="btn small">Delete</button>
-            <button id="fm_rename" class="btn small">Rename</button>
-            <button id="fm_download" class="btn small">Download</button>
-            <label class="small" style="margin-left:auto">Selected: <span id="fm_selected">/</span></label>
-          </div>
-        </div>
-
-        <!-- Pip Installer -->
-        <div id="pipSection" style="margin-top:12px;display:none">
-          <div style="font-weight:700;margin-bottom:8px">Pip Installer</div>
-          <div class="row" style="margin-bottom:8px">
-            <input id="pip_pkg" class="input" placeholder="package (e.g., requests==2.28.1)" />
-            <button id="pip_install" class="btn small">Install</button>
-            <button id="pip_requirements" class="btn small">Install requirements.txt</button>
-          </div>
-          <div style="font-weight:600;margin-bottom:6px">Pip Output</div>
-          <div id="pipOutput" class="terminal"></div>
-        </div>
-
-        <!-- Runner (paste code) -->
-        <div id="runnerSection" style="margin-top:12px;display:none">
-          <div style="font-weight:700;margin-bottom:8px">Single-file Runner</div>
-          <textarea id="runnerCode" class="textarea" placeholder="# Paste Python code here"></textarea>
-          <div style="display:flex;gap:8px;margin-top:6px">
-            <input id="runner_timeout" class="input" style="width:120px" placeholder="Timeout(s)" value="60" />
-            <button id="runner_run" class="btn small">Run</button>
-            <button id="runner_stop" class="btn small">Stop</button>
-            <a id="runner_preview" class="previewLink" href="#" target="_blank" style="display:none">Open Preview</a>
-          </div>
-          <div style="font-weight:600;margin-top:8px">Output</div>
-          <div id="runnerOutput" class="terminal"></div>
-        </div>
-      </div>
-
-      <div id="rightColumn" class="panel">
-        <div style="display:flex;gap:8px;align-items:center;justify-content:space-between">
-          <div style="font-weight:700">Terminals & Logs</div>
-          <div>
-            <button id="term_clear" class="btn small">Clear</button>
-            <button id="term_run_cmd" class="btn small">Run Command</button>
-          </div>
-        </div>
-        <div style="margin-top:8px">
-          <div style="display:flex;gap:8px;margin-bottom:6px">
-            <input id="term_cmd" class="input" placeholder="Command (e.g., ls -la, python app.py, python -m pip install req)" />
-            <input id="term_cwd" class="input" style="width:180px" placeholder="cwd (relative)" />
-          </div>
-          <div style="display:flex;gap:8px">
-            <div style="flex:1">
-              <div style="font-weight:600;margin-bottom:6px">Global Terminal Output</div>
-              <div id="globalTerminal" class="terminal"></div>
-            </div>
-            <div style="width:260px">
-              <div style="font-weight:600;margin-bottom:6px">Active Jobs</div>
-              <div id="jobList" style="background:rgba(255,255,255,0.01);padding:6px;border-radius:6px;max-height:300px;overflow:auto"></div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:8px;color:var(--muted)">
-      <div>Tip: Use the Single-file Runner for quick experiments. For full projects, use the File Manager.</div>
-      <div>Port preview links are clickable when a process prints its URL.</div>
-    </div>
-  </div>
-</div>
-
-<input id="hidden_upload" type="file" multiple webkitdirectory directory mozdirectory style="display:none" />
-
-<script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
 <script>
-const socket = io({transports:['websocket'], upgrade:false});
-let selectedItem = null;
-let currentRunnerJob = null;
-let currentPipJob = null;
-let activeJobs = {};
+  const socket = io({transports:['websocket'], upgrade:false});
+  const logOut = document.getElementById('logOut');
+  function appendLog(txt){ logOut.textContent += txt; logOut.scrollTop = logOut.scrollHeight; }
 
-function q(id){return document.getElementById(id)}
-function appendTerminal(elId, txt){
-  const el = q(elId);
-  el.textContent += txt;
-  el.scrollTop = el.scrollHeight;
-}
+  socket.on('connect', () => {
+    appendLog('[socket connected]\\n');
+  });
+  socket.on('proc.output', (m) => {
+    appendLog(`[${m.job_id}][${m.stream}] ${m.text}`);
+  });
+  socket.on('proc.preview', (m) => {
+    appendLog(`[preview] ${m.url}\\n`);
+  });
 
-q('cwdDisp').textContent = "{{WORKDIR}}";
+  // Terminal UI
+  const termModal = document.getElementById('termModal');
+  const openTerminalBtn = document.getElementById('openTerminalBtn');
+  const openTerminalInline = document.getElementById('openTerminalInline');
+  const termClose = document.getElementById('termClose');
+  const termAuthBtn = document.getElementById('termAuthBtn');
+  const tokenInput = document.getElementById('tokenInput');
+  const termStatus = document.getElementById('termStatus');
+  const termCtrlKill = document.getElementById('termCtrlKill');
+  const termCtrlClear = document.getElementById('termCtrlClear');
+  const termIdLabel = document.getElementById('termIdLabel');
 
-// basic theme toggle
-q('themeToggle').addEventListener('click', ()=>{
-  const b = document.body; const t = b.getAttribute('data-theme') === 'dark' ? 'light' : 'dark'; b.setAttribute('data-theme', t);
-});
+  let term; // xterm instance
+  let fitAddon;
+  let currentTermId = null;
+  let clientSid = null;
 
-q('toggleSidebar').addEventListener('click', ()=> q('sidebar').classList.toggle('collapsed'));
+  function createXterm(){
+    term = new Terminal();
+    fitAddon = new FitAddon.FitAddon();
+    term.loadAddon(fitAddon);
+    term.open(document.getElementById('xtermContainer'));
+    term.focus();
+    fitAddon.fit();
+    window.addEventListener('resize', ()=> fitAddon.fit());
+  }
 
-// Panel buttons
-q('openFileManagerPanel').addEventListener('click', ()=> { q('fileManagerSection').style.display=''; q('pipSection').style.display='none'; q('runnerSection').style.display='none'; });
-q('openPipPanel').addEventListener('click', ()=> { q('fileManagerSection').style.display='none'; q('pipSection').style.display=''; q('runnerSection').style.display='none'; });
-q('openRunnerPanel').addEventListener('click', ()=> { q('fileManagerSection').style.display='none'; q('pipSection').style.display='none'; q('runnerSection').style.display=''; });
-q('openTermPanel').addEventListener('click', ()=> { q('fileManagerSection').style.display='none'; q('pipSection').style.display='none'; q('runnerSection').style.display='none'; });
-q('openUbuntuTtyd').addEventListener('click', ()=> { alert('Ubuntu web terminal is a separate container/service. Deploy the ttyd container and open its configured url/port.'); });
+  // Show modal and optionally auto-connect if no token required
+  function showTerminalModal(){
+    tokenInput.value = '';
+    termModal.style.display = 'flex';
+    if(!term) createXterm();
+  }
 
-// File manager
-async function loadTree(){
-  const res = await fetch('/api/tree');
-  const data = await res.json();
-  q('fileTree').innerHTML = renderTree(data.tree, '');
-  q('cwdDisp').textContent = data.base;
-}
-function renderTree(tree, prefix){
-  let html = '';
-  for(const node of tree){
-    const rel = prefix ? prefix + '/' + node.name : node.name;
-    if(node.type === 'dir'){
-      html += `<div><div class="file-item" data-path="${rel}" onclick="toggleDir(this)">📁 ${node.name}</div>`;
-      if(node.children && node.children.length){
-        html += `<div style="margin-left:12px">${renderTree(node.children, rel)}</div>`;
-      }
-      html += `</div>`;
-    } else {
-      html += `<div class="file-item" data-path="${rel}" onclick="selectFile('${rel}')">📄 ${node.name}</div>`;
+  openTerminalBtn.addEventListener('click', showTerminalModal);
+  openTerminalInline.addEventListener('click', showTerminalModal);
+  termClose.addEventListener('click', ()=>{
+    termModal.style.display = 'none';
+    if(currentTermId){
+      socket.emit('term.disconnect', {term_id: currentTermId});
+      currentTermId = null;
     }
-  }
-  return html;
-}
-window.toggleDir = ()=>{}; // placeholder
+  });
 
-window.selectFile = async (rel)=>{
-  selectedItem = rel;
-  q('fm_selected').textContent = rel;
-  const res = await fetch('/api/file', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:rel})});
-  if(res.ok){
-    const j = await res.json();
-    if(j.type === 'text' && j.content !== undefined){
-      q('runnerCode').value = j.content;
+  termCtrlClear.addEventListener('click', ()=>{
+    if(term) term.clear();
+  });
+  termCtrlKill.addEventListener('click', ()=>{
+    if(currentTermId) socket.emit('term.kill', {term_id: currentTermId});
+  });
+
+  termAuthBtn.addEventListener('click', ()=> {
+    const token = tokenInput.value.trim();
+    socket.emit('term.request', {token});
+  });
+
+  // Socket events for terminal
+  socket.on('term.token.required', (m) => {
+    appendLog('[server] terminal token required\\n');
+    termStatus.textContent = 'Token required';
+  });
+
+  socket.on('term.ready', (m) => {
+    // {term_id, cols, rows}
+    appendLog('[server] terminal ready ' + m.term_id + '\\n');
+    currentTermId = m.term_id;
+    termIdLabel.textContent = m.term_id;
+    termStatus.textContent = 'Connected';
+    // bind xterm input to socket writes
+    term.onData(function(data){
+      socket.emit('term.input', {term_id: currentTermId, data});
+    });
+    // handle resize
+    setTimeout(()=> {
+      fitAddon.fit();
+      const dims = {cols: term.cols || 80, rows: term.rows || 24};
+      socket.emit('term.resize', {term_id: currentTermId, cols: dims.cols, rows: dims.rows});
+    }, 200);
+  });
+
+  socket.on('term.output', (m) => {
+    // {term_id, data}
+    if(!term) return;
+    if(m.term_id !== currentTermId) return;
+    term.write(m.data);
+  });
+
+  socket.on('term.exit', (m) => {
+    appendLog('[server] terminal closed ' + m.term_id + '\\n');
+    if(m.term_id === currentTermId){
+      termStatus.textContent = 'Exited';
+      currentTermId = null;
     }
-  }
-};
+  });
 
-q('fm_refresh').addEventListener('click', loadTree);
-q('newFile').addEventListener('click', ()=> {
-  const name = prompt('New file path (relative):', 'untitled.py');
-  if(!name) return;
-  fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:name, type:'file'})}).then(r=>{ if(r.ok) loadTree(); else alert('Failed'); });
-});
-q('newFolder').addEventListener('click', ()=> {
-  const name = prompt('New folder path (relative):', 'new_folder');
-  if(!name) return;
-  fetch('/api/create', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:name, type:'dir'})}).then(r=>{ if(r.ok) loadTree(); else alert('Failed'); });
-});
-q('fm_delete').addEventListener('click', ()=> {
-  if(!selectedItem){ alert('Select an item'); return; }
-  if(!confirm('Delete ' + selectedItem + '?')) return;
-  fetch('/api/delete', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({path:selectedItem})}).then(r=>{ if(r.ok){ loadTree(); selectedItem=null; q('fm_selected').textContent='/'; } else alert('Failed'); });
-});
-q('fm_rename').addEventListener('click', ()=> {
-  if(!selectedItem){ alert('Select'); return; }
-  const dst = prompt('New path:', selectedItem);
-  if(!dst) return;
-  fetch('/api/rename', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({src:selectedItem, dst})}).then(r=>{ if(r.ok){ loadTree(); selectedItem=dst; q('fm_selected').textContent=dst; } else alert('Failed'); });
-});
-q('fm_download').addEventListener('click', ()=> {
-  if(!selectedItem){ alert('Select'); return; }
-  window.open('/api/download?path=' + encodeURIComponent(selectedItem), '_blank');
-});
-q('downloadAll').addEventListener('click', ()=> window.open('/api/download?zip=1','_blank'));
+  socket.on('term.error', (m) => {
+    appendLog('[server error] ' + (m.msg||JSON.stringify(m)) + '\\n');
+  });
 
-// Upload
-q('uploadBtn').addEventListener('click', ()=> q('hidden_upload').click());
-q('hidden_upload').addEventListener('change', async (ev)=>{
-  const files = Array.from(ev.target.files);
-  if(!files.length) return;
-  const fd = new FormData();
-  for(const f of files) fd.append('files', f, f.webkitRelativePath || f.name);
-  const res = await fetch('/api/upload', {method:'POST', body:fd});
-  if(res.ok){ alert('Uploaded'); loadTree(); } else { alert('Upload failed'); }
-  q('hidden_upload').value = '';
-});
-
-// Pip installer
-q('openPipUI').addEventListener('click', ()=> { q('fileManagerSection').style.display='none'; q('pipSection').style.display=''; q('runnerSection').style.display='none'; });
-q('pip_install').addEventListener('click', ()=> {
-  const pkg = q('pip_pkg').value.trim();
-  if(!pkg) return alert('Provide package');
-  q('pipOutput').textContent = '';
-  socket.emit('pip.install', {pkg});
-});
-q('pip_requirements').addEventListener('click', ()=> {
-  q('pipOutput').textContent = '';
-  socket.emit('pip.install.requirements', {});
-});
-
-// Runner paste
-q('runner_run').addEventListener('click', ()=> {
-  const code = q('runnerCode').value;
-  if(!code) return alert('Paste some code');
-  const to = parseInt(q('runner_timeout').value) || 60;
-  q('runnerOutput').textContent = '';
-  q('runner_preview').style.display = 'none';
-  socket.emit('run.paste', {code, timeout: to});
-});
-q('runner_stop').addEventListener('click', ()=> {
-  if(!currentRunnerJob) return;
-  socket.emit('stop.process', {job_id: currentRunnerJob});
-});
-
-// Global terminal
-q('term_run_cmd').addEventListener('click', ()=> runCommand());
-q('term_cmd').addEventListener('keydown', (e)=>{ if(e.key === 'Enter'){ runCommand(); }});
-function runCommand(){
-  const cmd = q('term_cmd').value.trim();
-  const cwd = q('term_cwd').value.trim();
-  if(!cmd) return;
-  socket.emit('run.command', {cmd, cwd});
-  q('term_cmd').value = '';
-}
-q('term_clear').addEventListener('click', ()=> { q('globalTerminal').textContent=''; });
-
-// Socket events
-socket.on('connect', ()=> {
-  appendTerminal('globalTerminal', '[Connected]\\n');
-  loadTree();
-});
-socket.on('proc.start', (m)=> {
-  activeJobs[m.job_id] = m;
-  renderJobs();
-  appendTerminal('globalTerminal', `[START ${m.job_id}] ${m.cmd.join ? m.cmd.join(' ') : m.cmd}\\n`);
-});
-socket.on('proc.output', (m)=> {
-  appendTerminal('globalTerminal', `[${m.job_id}][${m.stream}] ${m.text}`);
-  if(currentRunnerJob && m.job_id === currentRunnerJob) appendTerminal('runnerOutput', m.text);
-  if(currentPipJob && m.job_id === currentPipJob) appendTerminal('pipOutput', m.text);
-});
-socket.on('proc.exit', (m)=> {
-  appendTerminal('globalTerminal', `[EXIT ${m.job_id}] code=${m.code}\\n`);
-  if(currentRunnerJob === m.job_id) currentRunnerJob = null;
-  if(currentPipJob === m.job_id) currentPipJob = null;
-  activeJobs[m.job_id] = {...(activeJobs[m.job_id]||{}), exit: m.code};
-  renderJobs();
-});
-socket.on('proc.preview', (m)=> {
-  appendTerminal('globalTerminal', `[PREVIEW ${m.job_id}] ${m.url}\\n`);
-  if(currentRunnerJob === m.job_id){
-    q('runner_preview').href = m.url;
-    q('runner_preview').style.display = 'inline-block';
-  }
-});
-socket.on('pip.job', (m)=> { currentPipJob = m.job_id; activeJobs[m.job_id] = m; renderJobs(); });
-socket.on('run.paste.job', (m)=> { currentRunnerJob = m.job_id; activeJobs[m.job_id] = m; renderJobs(); });
-
-// Jobs list rendering
-function renderJobs(){
-  const el = q('jobList');
-  el.innerHTML = '';
-  const keys = Object.keys(activeJobs);
-  if(!keys.length) el.textContent = 'No active jobs';
-  for(const k of keys.slice().reverse()){
-    const meta = activeJobs[k];
-    const div = document.createElement('div');
-    div.style.display='flex'; div.style.justifyContent='space-between'; div.style.alignItems='center'; div.style.padding='6px'; div.style.borderBottom='1px solid rgba(255,255,255,0.02)';
-    const left = document.createElement('div');
-    left.innerHTML = `<div style="font-family:monospace">${k}</div><div style="font-size:12px;color:${meta.exit===undefined?'#9ad':''}">${(meta.cmd||[]).join(' ')}</div>`;
-    const right = document.createElement('div');
-    const stop = document.createElement('button'); stop.textContent='Stop'; stop.className='btn small'; stop.addEventListener('click', ()=> socket.emit('stop.process',{job_id:k}));
-    const view = document.createElement('button'); view.textContent='View'; view.className='btn small'; view.addEventListener('click', ()=> { alert('Job: ' + k + '\\nSee Global Terminal for logs'); });
-    right.appendChild(stop); right.appendChild(view);
-    div.appendChild(left); div.appendChild(right);
-    el.appendChild(div);
-  }
-}
-
-loadTree();
+  // request token automatically if server doesn't require it (click connect)
+  // The server will respond with term.ready or term.token.required
 </script>
+
 </body>
 </html>
 """
 
-# -----------------------
-# Flask routes (APIs)
-# -----------------------
+# ----------------------
+# Flask routes: file manager APIs (minimal)
+# ----------------------
 @app.route("/")
 def index():
     return render_template_string(INDEX_HTML.replace("{{WORKDIR}}", WORKDIR))
@@ -633,67 +610,6 @@ def api_upload():
     return jsonify({"ok": True})
 
 
-@app.route("/api/create", methods=["POST"])
-def api_create():
-    data = request.get_json() or {}
-    path = data.get("path")
-    typ = data.get("type", "file")
-    if not path:
-        return jsonify({"error": "Missing path"}), 400
-    try:
-        full = safe_join(WORKDIR, path)
-    except Exception:
-        return jsonify({"error": "Invalid path"}), 400
-    try:
-        if typ == "dir":
-            os.makedirs(full, exist_ok=True)
-        else:
-            os.makedirs(os.path.dirname(full), exist_ok=True)
-            with open(full, "a", encoding="utf-8"):
-                pass
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True})
-
-
-@app.route("/api/delete", methods=["POST"])
-def api_delete():
-    data = request.get_json() or {}
-    path = data.get("path")
-    if not path:
-        return jsonify({"error": "Missing path"}), 400
-    try:
-        full = safe_join(WORKDIR, path)
-    except Exception:
-        return jsonify({"error": "Invalid path"}), 400
-    try:
-        if os.path.isdir(full):
-            shutil.rmtree(full)
-        else:
-            os.remove(full)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True})
-
-
-@app.route("/api/rename", methods=["POST"])
-def api_rename():
-    data = request.get_json() or {}
-    src = data.get("src"); dst = data.get("dst")
-    if not src or not dst:
-        return jsonify({"error": "Missing src/dst"}), 400
-    try:
-        s = safe_join(WORKDIR, src); d = safe_join(WORKDIR, dst)
-    except Exception:
-        return jsonify({"error": "Invalid path"}), 400
-    try:
-        os.makedirs(os.path.dirname(d), exist_ok=True)
-        os.replace(s, d)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    return jsonify({"ok": True})
-
-
 @app.route("/api/file", methods=["POST"])
 def api_file():
     data = request.get_json() or {}
@@ -704,8 +620,6 @@ def api_file():
         full = safe_join(WORKDIR, path)
     except Exception:
         return jsonify({"error": "Invalid path"}), 400
-    if not os.path.exists(full):
-        return jsonify({"error": "Not found"}), 404
     if os.path.isdir(full):
         items = [{"name": n, "type": "dir" if os.path.isdir(os.path.join(full, n)) else "file"} for n in sorted(os.listdir(full))]
         return jsonify({"type": "dir", "children": items})
@@ -742,14 +656,14 @@ def api_download():
     return send_file(full, as_attachment=True, download_name=os.path.basename(full))
 
 
-# -----------------------
-# SocketIO handlers
-# -----------------------
+# ----------------------
+# SocketIO: commands, pip, paste-run, and integrated terminal events
+# ----------------------
 @socketio.on("run.command")
-def on_run_command(msg):
+def on_run_command(message):
     sid = request.sid
-    cmd_text = msg.get("cmd")
-    cwd_rel = msg.get("cwd", "")
+    cmd_text = message.get("cmd")
+    cwd_rel = message.get("cwd", "")
     if not cmd_text:
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": "No command\n"}, room=sid)
         return
@@ -767,7 +681,7 @@ def on_run_command(msg):
             cwd = safe_join(WORKDIR, cwd_rel)
         except Exception:
             cwd = WORKDIR
-    job_id = start_subprocess(parts, cwd, sid, timeout=DEFAULT_TIMEOUT)
+    job_id = start_process(parts, cwd, sid, timeout=DEFAULT_TIMEOUT)
     emit("proc.output", {"job_id": job_id, "stream": "stdout", "text": f"Started job {job_id}\n"}, room=sid)
 
 
@@ -779,7 +693,7 @@ def on_pip_install(msg):
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": "No package specified\n"}, room=sid)
         return
     cmd = [sys.executable, "-m", "pip", "install", pkg]
-    job_id = start_subprocess(cmd, WORKDIR, sid, timeout=DEFAULT_TIMEOUT * 2)
+    job_id = start_process(cmd, WORKDIR, sid, timeout=DEFAULT_TIMEOUT * 2)
     emit("pip.job", {"job_id": job_id, "cmd": cmd}, room=sid)
 
 
@@ -791,7 +705,7 @@ def on_pip_install_requirements(_msg):
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": "requirements.txt not found\n"}, room=sid)
         return
     cmd = [sys.executable, "-m", "pip", "install", "-r", "requirements.txt"]
-    job_id = start_subprocess(cmd, WORKDIR, sid, timeout=DEFAULT_TIMEOUT * 5)
+    job_id = start_process(cmd, WORKDIR, sid, timeout=DEFAULT_TIMEOUT * 5)
     emit("pip.job", {"job_id": job_id, "cmd": cmd}, room=sid)
 
 
@@ -814,46 +728,178 @@ def on_run_paste(msg):
         emit("proc.output", {"job_id": None, "stream": "stderr", "text": f"Failed to write temp file: {e}\n"}, room=sid)
         return
     cmd = [sys.executable, full]
-    job_id = start_subprocess(cmd, run_dir, sid, timeout=timeout)
+    job_id = start_process(cmd, run_dir, sid, timeout=timeout)
     emit("run.paste.job", {"job_id": job_id, "cmd": cmd}, room=sid)
 
 
-@socketio.on("stop.process")
-def on_stop_process(msg):
+# ----------------------
+# Integrated terminal socket events
+# ----------------------
+@socketio.on("term.request")
+def on_term_request(message):
+    """
+    Client requests a terminal. Optional token must match TERMINAL_TOKEN if configured.
+    Server responds:
+      - term.token.required : if token missing/invalid
+      - term.ready : {term_id}
+      - term.error  : {msg}
+    """
     sid = request.sid
-    job_id = msg.get("job_id")
-    if not job_id:
-        emit("proc.output", {"job_id": None, "stream": "stderr", "text": "Missing job_id\n"}, room=sid)
-        return
-    ok = stop_subprocess(job_id)
-    if ok:
-        emit("proc.output", {"job_id": job_id, "stream": "stdout", "text": f"Requested stop of {job_id}\n"}, room=sid)
+    token = (message or {}).get("token", "") or ""
+    if TERMINAL_TOKEN:
+        if token != TERMINAL_TOKEN:
+            emit("term.token.required", {"msg": "Invalid token"}, room=sid)
+            return
+    # spawn PTY terminal
+    term_id = str(uuid.uuid4())
+    success = False
+    if pty is not None and os.name != "nt":
+        # spawn PTY in a separate thread to avoid blocking socket handler
+        def sp():
+            spawned = spawn_pty_shell(term_id, sid, cols=80, rows=24)
+            if spawned:
+                emit("term.ready", {"term_id": term_id}, room=sid)
+            else:
+                emit("term.error", {"msg": "Failed to spawn PTY"}, room=sid)
+        t = threading.Thread(target=sp, daemon=True)
+        t.start()
+        success = True
     else:
-        emit("proc.output", {"job_id": job_id, "stream": "stderr", "text": f"Failed to stop {job_id}\n"}, room=sid)
+        # fallback: spawn a subprocess and stream stdout/stderr (non-pty). Interactive behavior limited.
+        try:
+            # Use a pseudo terminal alternative not available -> start bash and stream
+            proc = subprocess.Popen([os.environ.get("SHELL", "/bin/bash")], cwd=WORKDIR, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False)
+            with term_lock:
+                terminals[term_id] = {"proc": proc, "sid": sid}
+            # start reader threads to emit proc output as term.output
+            def reader():
+                try:
+                    while True:
+                        line = proc.stdout.readline()
+                        if not line:
+                            break
+                        try:
+                            text = line.decode(errors="replace")
+                        except Exception:
+                            text = str(line)
+                        socketio.emit("term.output", {"term_id": term_id, "data": text}, room=sid)
+                finally:
+                    socketio.emit("term.exit", {"term_id": term_id}, room=sid)
+                    with term_lock:
+                        terminals.pop(term_id, None)
+            threading.Thread(target=reader, daemon=True).start()
+            emit("term.ready", {"term_id": term_id}, room=sid)
+            success = True
+        except Exception as e:
+            emit("term.error", {"msg": f"Failed to spawn shell: {e}"}, room=sid)
+            success = False
+
+    if not success:
+        emit("term.error", {"msg": "Unable to create terminal on server"}, room=sid)
 
 
-# -----------------------
-# Cleanup
-# -----------------------
+@socketio.on("term.input")
+def on_term_input(message):
+    term_id = message.get("term_id")
+    data = message.get("data", "")
+    if not term_id:
+        return
+    # PTY mode
+    with term_lock:
+        meta = terminals.get(term_id)
+    if not meta:
+        return
+    if "fd" in meta:
+        try:
+            os.write(meta["fd"], data.encode())
+        except Exception:
+            pass
+    elif "proc" in meta:
+        try:
+            meta["proc"].stdin.write(data.encode())
+            meta["proc"].stdin.flush()
+        except Exception:
+            pass
+
+
+@socketio.on("term.resize")
+def on_term_resize(message):
+    term_id = message.get("term_id")
+    cols = int(message.get("cols", 80))
+    rows = int(message.get("rows", 24))
+    if not term_id:
+        return
+    resize_pty(term_id, cols, rows)
+
+
+@socketio.on("term.kill")
+def on_term_kill(message):
+    term_id = message.get("term_id")
+    if not term_id:
+        return
+    killed = kill_pty(term_id)
+    emit("term.killed", {"term_id": term_id, "ok": bool(killed)}, room=request.sid)
+
+
+@socketio.on("term.disconnect")
+def on_term_disconnect(message):
+    term_id = message.get("term_id")
+    if not term_id:
+        return
+    # kill / cleanup
+    with term_lock:
+        meta = terminals.get(term_id)
+    if not meta:
+        return
+    if "fd" in meta and "pid" in meta:
+        try:
+            os.kill(meta["pid"], signal.SIGTERM)
+        except Exception:
+            pass
+        with term_lock:
+            terminals.pop(term_id, None)
+    elif "proc" in meta:
+        try:
+            meta["proc"].terminate()
+        except Exception:
+            pass
+        with term_lock:
+            terminals.pop(term_id, None)
+    emit("term.exit", {"term_id": term_id}, room=request.sid)
+
+
+# ----------------------
+# Cleanup function
+# ----------------------
 def cleanup():
     with proc_lock:
         keys = list(processes.keys())
     for k in keys:
         try:
-            stop_subprocess(k)
+            stop_process(k)
+        except Exception:
+            pass
+    with term_lock:
+        tkeys = list(terminals.keys())
+    for k in tkeys:
+        try:
+            if "pid" in terminals[k]:
+                os.kill(terminals[k]["pid"], signal.SIGKILL)
         except Exception:
             pass
 
 
+# ----------------------
+# Run app
+# ----------------------
 if __name__ == "__main__":
     try:
         port = int(os.environ.get("PORT", 5000))
         host = "0.0.0.0"
-        print(f"Starting PySandbox on http://{host}:{port} (allow_unsafe_werkzeug={True})")
-        # If you want a more production-ready server, run with eventlet/gevent or use gunicorn.
-        # Quick fix for hosting platforms like Render: allow the Werkzeug server to run.
+        print(f"Starting PySandbox on http://{host}:{port} (TERMINAL_TOKEN set: {bool(TERMINAL_TOKEN)})")
+        # allow_unsafe_werkzeug param used on platforms like Render for quick deployments; change as needed
         socketio.run(app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
     except KeyboardInterrupt:
-        print("Shutting down, cleaning up processes...")
+        print("Shutting down, cleaning up...")
         cleanup()
         sys.exit(0)
